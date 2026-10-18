@@ -1,0 +1,787 @@
+# ============================================================
+# PASSIVE GITHUB EXPOSURE REVIEW — v5.0 (ANY TARGET)
+# Google Colab | Metadata-only | Single cell
+# Improved: noise filter + high-value boost + focused queries
+# ============================================================
+# HOW TO USE:
+# 1) Put GITHUB_TOKEN in Colab Secrets (enable notebook access)
+# 2) Edit TARGETS below (domain + aliases + optional github_orgs)
+# 3) Set authorized=True only for targets you are allowed to review
+# 4) Run the cell — download the ZIP when finished
+# ============================================================
+
+import os
+import re
+import csv
+import json
+import time
+import zipfile
+import requests
+from datetime import datetime, timezone
+
+# ---------------- CONFIGURATION ----------------
+TARGETS = [
+    {
+        "domain": "example.com",          # <-- change this
+        "label": "Example",               # <-- change this
+        "aliases": [
+            # "api.example.com",
+            # "staging.example.com",
+        ],
+        # Add only verified GitHub organization names (optional but powerful)
+        "github_orgs": [
+            # "ExampleOrg",
+        ],
+        "authorized": True,
+    },
+]
+
+GITHUB_API = "https://api.github.com"
+PER_PAGE = 100
+MAX_PAGES_PER_QUERY = 5          # was 10 — first pages are usually enough
+MAX_RETRIES = 5
+REQUEST_TIMEOUT = 30
+PAUSE_BETWEEN_QUERIES = 2
+PAUSE_BETWEEN_TARGETS = 4
+MAX_QUERY_LENGTH = 256
+
+OUTPUT_ROOT = "/content/github_exposure_review"
+RUN_STAMP = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+RUN_DIR = os.path.join(OUTPUT_ROOT, f"run_{RUN_STAMP}")
+COMBINED_DIR = os.path.join(RUN_DIR, "combined")
+os.makedirs(COMBINED_DIR, exist_ok=True)
+
+# ---------------- AUTHENTICATION ----------------
+def get_github_token():
+    token = os.environ.get("GITHUB_TOKEN", "").strip()
+    if token:
+        return token
+    try:
+        from google.colab import userdata
+        token = (userdata.get("GITHUB_TOKEN") or "").strip()
+        if token:
+            return token
+    except Exception:
+        pass
+    raise RuntimeError(
+        "GITHUB_TOKEN not found. Add it to Colab Secrets "
+        "and enable notebook access. Never print the token."
+    )
+
+TOKEN = get_github_token()
+SESSION = requests.Session()
+SESSION.headers.update({
+    "Accept": "application/vnd.github+json",
+    "Authorization": f"Bearer {TOKEN}",
+    "X-GitHub-Api-Version": "2022-11-28",
+    "User-Agent": "Passive-GitHub-Exposure-Review/5.0",
+})
+
+# ---------------- HELPERS ----------------
+def utc_now():
+    return datetime.now(timezone.utc).isoformat()
+
+def safe_slug(value):
+    value = re.sub(r"[^A-Za-z0-9.-]+", "-", str(value))
+    return value.strip("._-") or "target"
+
+def canonical_domain(value):
+    value = str(value or "").strip().lower()
+    value = re.sub(r"^https?://", "", value)
+    value = value.split("/")[0].split(":")[0]
+    return value.strip(".")
+
+def write_json(path, data):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+def write_csv(path, rows, fieldnames):
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(
+            f, fieldnames=fieldnames, extrasaction="ignore"
+        )
+        writer.writeheader()
+        for row in rows:
+            out = dict(row)
+            for key, value in list(out.items()):
+                if isinstance(value, (list, dict)):
+                    out[key] = json.dumps(value, ensure_ascii=False)
+            writer.writerow(out)
+
+def result_file_url(item):
+    url = item.get("html_url")
+    if url:
+        return url
+    repo = (item.get("repository") or {}).get("full_name", "")
+    path = item.get("path", "")
+    if repo and path:
+        return f"https://github.com/{repo}/blob/HEAD/{path}"
+    return ""
+
+# ---------------- NOISE / HIGH-VALUE FILTERS ----------------
+EXCLUDE_PATH_MARKERS = (
+    "/test/", "/tests/", "/__tests__/", "/spec/",
+    "/fixtures/", "/fixture/", "/examples/", "/example/",
+    "/samples/", "/sample/", "/mocks/", "/mock/",
+    "/docs/", "/documentation/", "/changelog",
+    ".example", ".sample", ".template", ".dist",
+    "readme", "node_modules/", "vendor/", "/dist/", "/build/",
+)
+
+HIGH_VALUE_PATH_MARKERS = (
+    "/.env", ".env.production", ".env.local", ".env.staging",
+    ".env.docker", ".env.prod", ".env.dev",
+    "credentials.json", "service-account.json",
+    "secrets.yml", "secrets.yaml", "secret.json",
+    "terraform.tfvars", "terraform.tfstate",
+    "id_rsa", "id_ed25519", "kubeconfig",
+    "wp-config.php", "application.properties", "application.yml",
+    "settings.py", ".npmrc", ".pypirc",
+)
+
+def is_noise_path(path: str) -> bool:
+    p = (path or "").lower()
+    if p.endswith((".md", ".rst", ".txt", ".html")):
+        # keep only if path looks secret-related
+        if not any(x in p for x in ("secret", "credential", "password", ".env")):
+            return True
+    return any(m in p for m in EXCLUDE_PATH_MARKERS)
+
+def is_high_value_path(path: str) -> bool:
+    p = (path or "").lower()
+    return any(m in p for m in HIGH_VALUE_PATH_MARKERS)
+
+def likely_example_path(path):
+    return is_noise_path(path)
+
+# ---------------- SEARCH STRATEGIES (FOCUSED) ----------------
+# High-signal first — fewer queries, cleaner leads
+HIGH_SIGNAL_FILENAME = [
+    "filename:.env",
+    "filename:.env.production",
+    "filename:.env.local",
+    "filename:.env.staging",
+    "filename:credentials.json",
+    "filename:service-account.json",
+    "filename:secrets.yml",
+    "filename:secrets.yaml",
+    "filename:terraform.tfvars",
+    "filename:id_rsa",
+    "filename:id_ed25519",
+    "filename:kubeconfig",
+    "filename:wp-config.php",
+    "filename:application.properties",
+    "filename:application.yml",
+    "filename:settings.py",
+    "filename:.npmrc",
+]
+
+HIGH_SIGNAL_CREDENTIAL = [
+    '"BEGIN PRIVATE KEY"',
+    '"BEGIN RSA PRIVATE KEY"',
+    '"BEGIN OPENSSH PRIVATE KEY"',
+    '"AKIA"',
+    '"ghp_"',
+    '"github_pat_"',
+    '"xoxb-"',
+    '"mongodb+srv://"',
+    '"postgresql://"',
+    '"postgres://"',
+    '"DATABASE_URL="',
+    '"AWS_SECRET_ACCESS_KEY"',
+    '"AWS_ACCESS_KEY_ID"',
+    '"STRIPE_SECRET_KEY"',
+    '"sk_live_"',
+    '"rk_live_"',
+    '"SENDGRID_API_KEY"',
+    '"client_secret"',
+    '"private_key_id"',
+]
+
+CLOUD_CI_PATTERNS = [
+    '"GOOGLE_APPLICATION_CREDENTIALS"',
+    '"CF_API_TOKEN"',
+    '"CLOUDFLARE_API_TOKEN"',
+    '"SENTRY_AUTH_TOKEN"',
+    '"NPM_TOKEN"',
+    '"DOCKER_PASSWORD"',
+    '"REDIS_URL"',
+]
+
+def build_queries(target):
+    domain = canonical_domain(target["domain"])
+    aliases = []
+    for value in [domain] + (target.get("aliases") or []):
+        value = canonical_domain(value)
+        if value and value not in aliases:
+            aliases.append(value)
+
+    orgs = []
+    for value in target.get("github_orgs") or []:
+        value = str(value).strip()
+        if value and value not in orgs:
+            orgs.append(value)
+
+    queries = []
+    seen = set()
+
+    def add(category, query, basis):
+        query = " ".join(str(query).split()).strip()
+        if not query or len(query) > MAX_QUERY_LENGTH:
+            return
+        key = query.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        queries.append({
+            "category": category,
+            "query": query,
+            "evidence_basis": basis,
+        })
+
+    for d in aliases:
+        # Domain context (light)
+        add("domain_reference", f'"{d}"', "exact domain reference")
+        add("domain_url_reference", f'"https://{d}"', "URL reference")
+
+        # High-signal filenames
+        for filename in HIGH_SIGNAL_FILENAME:
+            add(
+                "filename_indicator",
+                f'"{d}" {filename}',
+                "domain + sensitive filename",
+            )
+
+        # High-signal credentials
+        for pattern in HIGH_SIGNAL_CREDENTIAL:
+            add(
+                "credential_indicator",
+                f'"{d}" {pattern}',
+                "domain + credential indicator",
+            )
+
+        # Cloud / CI
+        for pattern in CLOUD_CI_PATTERNS:
+            add(
+                "cloud_ci_indicator",
+                f'"{d}" {pattern}',
+                "domain + cloud/CI indicator",
+            )
+
+        # Staging / production context with env files
+        add(
+            "domain_staging_context",
+            f'"{d}" "staging" filename:.env',
+            "domain + staging env",
+        )
+        add(
+            "domain_staging_context",
+            f'"{d}" "production" filename:.env',
+            "domain + production env",
+        )
+
+    # Organization-scoped (strongest when org is real)
+    for org in orgs:
+        add("org_reference", f"org:{org}", "verified organization scope")
+        for filename in HIGH_SIGNAL_FILENAME:
+            add(
+                "org_filename_indicator",
+                f"org:{org} {filename}",
+                "verified organization + sensitive filename",
+            )
+        for pattern in HIGH_SIGNAL_CREDENTIAL[:12]:
+            add(
+                "org_credential_indicator",
+                f"org:{org} {pattern}",
+                "verified organization + credential indicator",
+            )
+        for d in aliases:
+            add(
+                "org_domain_reference",
+                f'org:{org} "{d}"',
+                "verified organization + target domain",
+            )
+
+    return queries
+
+# ---------------- GITHUB API ----------------
+def github_search_code(query, page):
+    url = f"{GITHUB_API}/search/code"
+    params = {"q": query, "per_page": PER_PAGE, "page": page}
+    last_error = None
+    for attempt in range(MAX_RETRIES):
+        try:
+            response = SESSION.get(
+                url, params=params, timeout=REQUEST_TIMEOUT
+            )
+            if response.status_code == 200:
+                try:
+                    return response.json(), None, response.headers
+                except ValueError:
+                    return (
+                        None,
+                        "HTTP 200 but response was not valid JSON",
+                        response.headers,
+                    )
+            body = (response.text or "")[:250]
+            last_error = f"HTTP {response.status_code}: {body}"
+            rate_limited = (
+                response.status_code == 403
+                and (
+                    response.headers.get("X-RateLimit-Remaining") == "0"
+                    or "rate limit" in body.lower()
+                    or "secondary rate" in body.lower()
+                )
+            )
+            retryable = response.status_code in (
+                403, 429, 500, 502, 503, 504
+            )
+            if attempt < MAX_RETRIES - 1 and (retryable or rate_limited):
+                delay = min(90, 2 ** (attempt + 1))
+                retry_after = response.headers.get("Retry-After", "")
+                reset = response.headers.get("X-RateLimit-Reset", "")
+                if retry_after.isdigit():
+                    delay = max(delay, min(90, int(retry_after)))
+                elif rate_limited and reset.isdigit():
+                    remaining = max(1, int(reset) - int(time.time()))
+                    delay = max(delay, min(90, remaining))
+                time.sleep(delay)
+                continue
+            return None, last_error, response.headers
+        except requests.RequestException as exc:
+            last_error = f"{type(exc).__name__}: {str(exc)[:200]}"
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(min(30, 2 ** (attempt + 1)))
+    return None, last_error or "Unknown request error", {}
+
+# ---------------- TRIAGE (IMPROVED) ----------------
+def triage_result(path, categories, queries, target_domains):
+    p = (path or "").lower()
+    q = " ".join(queries or []).lower()
+    categories = set(categories or [])
+    score = 0
+    reasons = []
+
+    if is_high_value_path(p):
+        score += 25
+        reasons.append("high-value config path")
+
+    if any(domain and domain in q for domain in target_domains):
+        score += 15
+        reasons.append("query includes target domain")
+
+    if categories.intersection({
+        "credential_indicator",
+        "org_credential_indicator",
+        "cloud_ci_indicator",
+    }):
+        score += 15
+        reasons.append("credential/cloud configuration search hit")
+
+    if categories.intersection({
+        "filename_indicator",
+        "org_filename_indicator",
+    }):
+        score += 10
+        reasons.append("sensitive filename search hit")
+
+    if is_noise_path(p):
+        score -= 30
+        reasons.append("noise/example/test path")
+
+    if p.endswith((".md", ".rst", ".txt", ".html")):
+        score -= 8
+        reasons.append("documentation-like extension")
+
+    score = max(0, min(100, score))
+
+    if score >= 40:
+        tier = "A_REVIEW_FIRST"
+    elif score >= 25:
+        tier = "B_REVIEW"
+    elif score >= 12:
+        tier = "C_CONTEXT"
+    else:
+        tier = "D_LOW_SIGNAL"
+
+    return score, tier, reasons
+
+# ---------------- MAIN RUN ----------------
+all_findings = {}
+all_query_logs = []
+target_summaries = []
+
+for target in TARGETS:
+    if not target.get("authorized", False):
+        print("Skipped target: authorized must be True.")
+        continue
+
+    domain = canonical_domain(target.get("domain"))
+    label = str(target.get("label") or domain).strip()
+    if not domain:
+        print(f"Skipped target with empty domain: {label}")
+        continue
+
+    target_dir = os.path.join(RUN_DIR, safe_slug(label))
+    os.makedirs(target_dir, exist_ok=True)
+
+    print("\n" + "=" * 65)
+    print(f"Target: {label} | {domain}")
+    print("=" * 65)
+
+    queries = build_queries(target)
+    findings_map = {}
+    query_logs = []
+
+    for qindex, qitem in enumerate(queries, start=1):
+        query = qitem["query"]
+        category = qitem["category"]
+        print(f"[{qindex}/{len(queries)}] {category}: {query}")
+
+        log = {
+            "target_domain": domain,
+            "target_label": label,
+            "category": category,
+            "query": query,
+            "evidence_basis": qitem["evidence_basis"],
+            "started_at_utc": utc_now(),
+            "pages_attempted": 0,
+            "items_returned": 0,
+            "reported_total_count": None,
+            "incomplete_results": None,
+            "errors": [],
+            "page_cap_reached": False,
+            "coverage_status": "NOT_COMPLETED",
+            "rate_limit_remaining": None,
+        }
+
+        for page in range(1, MAX_PAGES_PER_QUERY + 1):
+            log["pages_attempted"] = page
+            payload, error, headers = github_search_code(query, page)
+            if headers:
+                log["rate_limit_remaining"] = headers.get(
+                    "X-RateLimit-Remaining"
+                )
+            if error:
+                log["errors"].append({"page": page, "error": error})
+                print(f"  API issue on page {page}: {error}")
+                break
+
+            items = payload.get("items") or []
+            total = payload.get("total_count")
+            log["reported_total_count"] = total
+            log["incomplete_results"] = payload.get("incomplete_results")
+            log["items_returned"] += len(items)
+
+            for item in items:
+                repo_data = item.get("repository") or {}
+                repo = repo_data.get("full_name") or ""
+                path = item.get("path") or ""
+                url = result_file_url(item)
+                if not repo or not path or not url:
+                    continue
+
+                # Drop obvious noise early
+                if is_noise_path(path):
+                    continue
+
+                identity = (repo.lower(), path.lower())
+                if identity not in findings_map:
+                    findings_map[identity] = {
+                        "target_domain": domain,
+                        "target_label": label,
+                        "repository": repo,
+                        "path": path,
+                        "file_url": url,
+                        "matched_categories": [],
+                        "matched_queries": [],
+                        "evidence_bases": [],
+                        "search_result_count": 0,
+                        "review_status": "UNREVIEWED",
+                        "confirmed_vulnerability": False,
+                        "secret_value_collected": False,
+                        "metadata_only": True,
+                    }
+                row = findings_map[identity]
+                row["search_result_count"] += 1
+                if category not in row["matched_categories"]:
+                    row["matched_categories"].append(category)
+                if query not in row["matched_queries"]:
+                    row["matched_queries"].append(query)
+                if qitem["evidence_basis"] not in row["evidence_bases"]:
+                    row["evidence_bases"].append(qitem["evidence_basis"])
+
+            if len(items) < PER_PAGE:
+                break
+            if page == MAX_PAGES_PER_QUERY:
+                log["page_cap_reached"] = True
+
+        total = log["reported_total_count"]
+        if log["errors"]:
+            log["coverage_status"] = (
+                "PARTIAL_RESULTS_WITH_ERRORS"
+                if log["items_returned"]
+                else "FAILED"
+            )
+        elif log["incomplete_results"] is True:
+            log["coverage_status"] = "INCOMPLETE_RESULTS_FLAGGED"
+        elif log["page_cap_reached"] or (
+            total is not None
+            and total > log["items_returned"]
+            and log["pages_attempted"] >= MAX_PAGES_PER_QUERY
+        ):
+            log["page_cap_reached"] = True
+            log["coverage_status"] = "RESULT_WINDOW_CAPPED"
+        else:
+            log["coverage_status"] = (
+                "SEARCH_COMPLETED_NOT_PROOF_OF_EXHAUSTIVENESS"
+            )
+
+        log["finished_at_utc"] = utc_now()
+        query_logs.append(log)
+        all_query_logs.append(log)
+        time.sleep(PAUSE_BETWEEN_QUERIES)
+
+    domains_for_score = [
+        canonical_domain(x)
+        for x in [domain] + (target.get("aliases") or [])
+    ]
+
+    findings = list(findings_map.values())
+    for row in findings:
+        score, tier, reasons = triage_result(
+            row["path"],
+            row["matched_categories"],
+            row["matched_queries"],
+            domains_for_score,
+        )
+        row["triage_score"] = score
+        row["review_queue"] = tier
+        row["triage_reasons"] = reasons
+
+    findings.sort(key=lambda row: (
+        -row["triage_score"],
+        row["repository"].lower(),
+        row["path"].lower(),
+    ))
+
+    a_leads = [r for r in findings if r["review_queue"] == "A_REVIEW_FIRST"]
+    print(f"Unique leads: {len(findings)} | A_REVIEW_FIRST: {len(a_leads)}")
+
+    fields = [
+        "target_domain", "target_label", "repository", "path", "file_url",
+        "matched_categories", "matched_queries", "evidence_bases",
+        "search_result_count", "triage_score", "review_queue",
+        "triage_reasons", "review_status", "confirmed_vulnerability",
+        "secret_value_collected", "metadata_only",
+    ]
+
+    write_json(os.path.join(target_dir, "findings.json"), findings)
+    write_json(os.path.join(target_dir, "query_log.json"), query_logs)
+    write_csv(os.path.join(target_dir, "findings.csv"), findings, fields)
+    write_json(os.path.join(target_dir, "a_review_first.json"), a_leads)
+
+    with open(
+        os.path.join(target_dir, "review_queue.txt"),
+        "w",
+        encoding="utf-8",
+    ) as f:
+        f.write(
+            "PASSIVE GITHUB REVIEW QUEUE — UNCONFIRMED LEADS\n"
+            "Metadata only. No secret values collected or tested.\n"
+            "Triage score is not severity or vulnerability confirmation.\n\n"
+        )
+        for row in findings:
+            f.write(
+                f"[{row['review_queue']} | triage={row['triage_score']}] "
+                f"{row['repository']} | {row['path']}\n"
+                f"URL: {row['file_url']}\n"
+                f"Categories: {json.dumps(row['matched_categories'], ensure_ascii=False)}\n"
+                f"Matched queries: {len(row['matched_queries'])}\n"
+                f"Review status: {row['review_status']}\n\n"
+            )
+
+    with open(
+        os.path.join(target_dir, "a_review_first.txt"),
+        "w",
+        encoding="utf-8",
+    ) as f:
+        f.write("A_REVIEW_FIRST ONLY — START HERE\n\n")
+        for row in a_leads:
+            f.write(
+                f"[{row['triage_score']}] {row['repository']} | {row['path']}\n"
+                f"{row['file_url']}\n\n"
+            )
+
+    with open(
+        os.path.join(target_dir, "report.md"),
+        "w",
+        encoding="utf-8",
+    ) as f:
+        f.write(f"# Passive GitHub Exposure Review — {label}\n\n")
+        f.write(f"- Target domain: `{domain}`\n")
+        f.write(f"- Run UTC: `{RUN_STAMP}`\n")
+        f.write(f"- Queries generated: {len(queries)}\n")
+        f.write(f"- Queries logged: {len(query_logs)}\n")
+        f.write(f"- Unique repository/path leads: {len(findings)}\n")
+        f.write(f"- A_REVIEW_FIRST: {len(a_leads)}\n")
+        f.write(
+            f"- Queries with errors: "
+            f"{sum(bool(x['errors']) for x in query_logs)}\n"
+        )
+        f.write(
+            f"- Capped queries: "
+            f"{sum(x['page_cap_reached'] for x in query_logs)}\n\n"
+        )
+        f.write(
+            "## Coverage caveat\n\n"
+            "A completed query does not prove exhaustive coverage. "
+            "Review query_log.json before interpreting zero results.\n\n"
+        )
+        f.write("## A_REVIEW_FIRST leads\n\n")
+        for row in a_leads:
+            f.write(
+                f"- **({row['triage_score']})** "
+                f"[{row['repository']} — {row['path']}]({row['file_url']})\n"
+            )
+
+    summary = {
+        "target_domain": domain,
+        "target_label": label,
+        "queries_generated": len(queries),
+        "queries_run": len(query_logs),
+        "unique_repository_path_leads": len(findings),
+        "a_review_first_count": len(a_leads),
+        "queries_with_errors": sum(bool(x["errors"]) for x in query_logs),
+        "queries_with_incomplete_results": sum(
+            x["incomplete_results"] is True for x in query_logs
+        ),
+        "queries_capped": sum(bool(x["page_cap_reached"]) for x in query_logs),
+        "coverage_is_exhaustive": False,
+    }
+    target_summaries.append(summary)
+
+    for row in findings:
+        key = (
+            row["target_domain"],
+            row["repository"].lower(),
+            row["path"].lower(),
+        )
+        if key not in all_findings:
+            all_findings[key] = row
+        else:
+            existing = all_findings[key]
+            for field in (
+                "matched_categories",
+                "matched_queries",
+                "evidence_bases",
+            ):
+                for value in row[field]:
+                    if value not in existing[field]:
+                        existing[field].append(value)
+            existing["search_result_count"] += row["search_result_count"]
+            if row["triage_score"] > existing["triage_score"]:
+                existing["triage_score"] = row["triage_score"]
+                existing["review_queue"] = row["review_queue"]
+                existing["triage_reasons"] = row["triage_reasons"]
+
+    print(f"Saved: {target_dir}")
+    time.sleep(PAUSE_BETWEEN_TARGETS)
+
+# ---------------- COMBINED OUTPUTS ----------------
+combined = list(all_findings.values())
+combined.sort(key=lambda row: (
+    row["target_domain"],
+    -row["triage_score"],
+    row["repository"].lower(),
+    row["path"].lower(),
+))
+
+combined_fields = [
+    "target_domain", "target_label", "repository", "path", "file_url",
+    "matched_categories", "matched_queries", "evidence_bases",
+    "search_result_count", "triage_score", "review_queue",
+    "triage_reasons", "review_status", "confirmed_vulnerability",
+    "secret_value_collected", "metadata_only",
+]
+
+write_json(os.path.join(COMBINED_DIR, "all_findings.json"), combined)
+write_json(os.path.join(COMBINED_DIR, "all_query_logs.json"), all_query_logs)
+write_json(os.path.join(COMBINED_DIR, "target_summaries.json"), target_summaries)
+write_csv(
+    os.path.join(COMBINED_DIR, "all_findings.csv"),
+    combined,
+    combined_fields,
+)
+
+a_all = [r for r in combined if r["review_queue"] == "A_REVIEW_FIRST"]
+write_json(os.path.join(COMBINED_DIR, "all_a_review_first.json"), a_all)
+
+with open(
+    os.path.join(COMBINED_DIR, "all_review_queue.txt"),
+    "w",
+    encoding="utf-8",
+) as f:
+    f.write("ALL PASSIVE GITHUB LEADS — UNCONFIRMED\n\n")
+    for row in combined:
+        f.write(
+            f"[{row['review_queue']} | {row['triage_score']}] "
+            f"{row['target_domain']} | {row['repository']} | {row['path']}\n"
+            f"{row['file_url']}\n\n"
+        )
+
+with open(
+    os.path.join(COMBINED_DIR, "summary.md"),
+    "w",
+    encoding="utf-8",
+) as f:
+    f.write("# Combined Passive GitHub Exposure Review v5\n\n")
+    f.write(f"- Run UTC: `{RUN_STAMP}`\n")
+    f.write(f"- Targets configured: {len(TARGETS)}\n")
+    f.write(f"- Unique leads: {len(combined)}\n")
+    f.write(f"- A_REVIEW_FIRST total: {len(a_all)}\n\n")
+    f.write(
+        "| Target | Queries | Leads | A_FIRST | Errors | Capped |\n"
+        "|---|---:|---:|---:|---:|---:|\n"
+    )
+    for s in target_summaries:
+        f.write(
+            f"| {s['target_label']} | {s['queries_run']} "
+            f"| {s['unique_repository_path_leads']} "
+            f"| {s.get('a_review_first_count', 0)} "
+            f"| {s['queries_with_errors']} "
+            f"| {s['queries_capped']} |\n"
+        )
+    f.write(
+        "\nResults are passive, metadata-only leads. "
+        "No secret values were collected or tested.\n"
+    )
+
+zip_path = f"{RUN_DIR}.zip"
+with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+    for root, _, filenames in os.walk(RUN_DIR):
+        for filename in filenames:
+            full_path = os.path.join(root, filename)
+            zf.write(full_path, arcname=os.path.relpath(full_path, RUN_DIR))
+
+print("\n" + "=" * 65)
+print("RUN COMPLETE — v5.0")
+print("=" * 65)
+print("Run directory:", RUN_DIR)
+print("Combined outputs:", COMBINED_DIR)
+print("ZIP archive:", zip_path)
+print("Unique leads:", len(combined))
+print("A_REVIEW_FIRST:", len(a_all))
+for s in target_summaries:
+    print(
+        f"{s['target_label']}: leads={s['unique_repository_path_leads']} | "
+        f"A={s.get('a_review_first_count', 0)} | "
+        f"errors={s['queries_with_errors']} | "
+        f"capped={s['queries_capped']}"
+    )
+
+try:
+    from google.colab import files
+    files.download(zip_path)
+except Exception:
+    print("If auto-download did not start, download the ZIP from Colab Files.")
